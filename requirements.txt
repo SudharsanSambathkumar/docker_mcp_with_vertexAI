@@ -1,0 +1,4 @@
+mcp >= 1.5 
+docker >= 7.1 
+anyio >= 4.7
+httpx >= 0.28 

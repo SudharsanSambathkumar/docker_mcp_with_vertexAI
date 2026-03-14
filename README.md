@@ -189,7 +189,11 @@ docker ps
 ```bash
 python client.py
 ```
+### 4 Run Streamlit UI
 
+```bash
+streamlit run app.py
+```
 You should see:
 
 ```

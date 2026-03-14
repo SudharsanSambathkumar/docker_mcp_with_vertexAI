@@ -189,18 +189,18 @@ docker ps
 ```bash
 python client.py
 ```
-### 4 Run Streamlit UI
 
-```bash
-streamlit run app.py
-```
 You should see:
 
 ```
 Enterprise Docker Agent Ready.
 Type 'exit' to quit.
 ```
+### 4 Run Streamlit UI
 
+```bash
+streamlit run app.py
+```
 ---
 
 # Example Commands

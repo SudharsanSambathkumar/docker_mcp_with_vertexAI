@@ -35,15 +35,77 @@ logger = logging.getLogger("docker-mcp")
 
 app = Server("docker-mcp-server")
 
-# ─── Docker client (lazy) ────────────────────────────────────────────────────
+# ─── Docker client ────────────────────────────────────────────────────────────
+#
+# Connects to a REMOTE Docker daemon via TCP.
+# Required env vars:
+#   DOCKER_HOST         tcp://<VM_IP>:2375          (plain)
+#                   or  tcp://<VM_IP>:2376          (TLS)
+#
+# Optional TLS env vars (when using port 2376):
+#   DOCKER_TLS_VERIFY   set to "1" to enable TLS verification
+#   DOCKER_CERT_PATH    path to dir containing ca.pem, cert.pem, key.pem
+#
+# Set these in Cloud Run:
+#   gcloud run services update docker-mcp-ui \
+#     --set-env-vars DOCKER_HOST=tcp://YOUR_VM_IP:2375
+#
+# On the VM run: ./docker-daemon-setup.sh  to expose the daemon over TCP.
 
 _client: docker.DockerClient | None = None
 
 
 def get_client() -> docker.DockerClient:
     global _client
-    if _client is None:
-        _client = docker.from_env()
+    if _client is not None:
+        return _client
+
+    docker_host = os.environ.get("DOCKER_HOST", "tcp://34.10.122.88:2375").strip()
+    if not docker_host:
+        raise docker.errors.DockerException(
+            "DOCKER_HOST is not set.\n"
+            "Point it to your Docker VM, e.g.:\n"
+            "  export DOCKER_HOST=tcp://YOUR_VM_IP:2375\n\n"
+            "On Cloud Run set it as an env var:\n"
+            "  gcloud run services update SERVICE_NAME \\\n"
+            "    --set-env-vars DOCKER_HOST=tcp://YOUR_VM_IP:2375"
+        )
+
+    # Build TLS config when DOCKER_TLS_VERIFY=1 + DOCKER_CERT_PATH are set
+    tls_config: bool | docker.tls.TLSConfig = False
+    if os.environ.get("DOCKER_TLS_VERIFY") == "1":
+        cert_path = os.environ.get("DOCKER_CERT_PATH", "")
+        if not cert_path:
+            raise docker.errors.DockerException(
+                "DOCKER_TLS_VERIFY=1 requires DOCKER_CERT_PATH to be set.\n"
+                "DOCKER_CERT_PATH must point to a directory with ca.pem, cert.pem, key.pem"
+            )
+        tls_config = docker.tls.TLSConfig(
+            client_cert=(
+                os.path.join(cert_path, "cert.pem"),
+                os.path.join(cert_path, "key.pem"),
+            ),
+            ca_cert=os.path.join(cert_path, "ca.pem"),
+            verify=True,
+        )
+        logger.info("🔒 TLS enabled using certs from %s", cert_path)
+
+    try:
+        _client = docker.DockerClient(base_url=docker_host, tls=tls_config, timeout=10)
+        _client.ping()
+        logger.info("✅ Connected to Docker daemon at %s", docker_host)
+    except Exception as exc:
+        _client = None
+        raise docker.errors.DockerException(
+            f"Cannot reach Docker daemon at '{docker_host}'.\n"
+            f"Reason: {exc}\n\n"
+            "Checklist:\n"
+            "  1. VM is running and reachable\n"
+            "  2. Docker daemon is listening on TCP  (run docker-daemon-setup.sh)\n"
+            "  3. Firewall/VPC allows port 2375 (or 2376) from Cloud Run\n"
+            "  4. DOCKER_HOST value is correct — format: tcp://IP:PORT"
+        ) from exc
+
     return _client
 
 

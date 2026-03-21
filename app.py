@@ -1,12 +1,21 @@
-"""
+ """
 Docker MCP — Streamlit UI
-Powered by Gemini 2.5 Flash + MCP stdio
+Powered by Gemini 2.5 Flash on Vertex AI (ADC / Cloud Run — no API key needed)
 
-Run:
+Run locally:
+    gcloud auth application-default login
     streamlit run app.py
 
+Deploy to Cloud Run:
+    gcloud run deploy docker-mcp-ui --source . --region us-central1
+
+Environment variables (all optional):
+    GCP_PROJECT   — GCP project ID (auto-detected on Cloud Run)
+    GCP_LOCATION  — Vertex AI region  (default: us-central1)
+    GEMINI_MODEL  — override model    (default: gemini-2.5-flash)
+
 Requirements:
-    pip install streamlit google-genai mcp anyio httpx
+    pip install streamlit "google-genai[vertexai]" mcp anyio httpx
 """
 
 from __future__ import annotations
@@ -14,11 +23,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue as _queue
 import threading
-import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Generator
 
 import streamlit as st
 from google import genai
@@ -28,10 +37,12 @@ from mcp.client.stdio import stdio_client
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-GEMINI_MODEL      = "gemini-2.5-flash"
-SERVER_SCRIPT     = Path(__file__).parent / "server.py"
-MAX_TOOL_ROUNDS   = 10
-MAX_OUTPUT_TOKENS = 8192
+GEMINI_MODEL  = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GCP_PROJECT   = os.environ.get("GCP_PROJECT", os.environ.get("GOOGLE_CLOUD_PROJECT", ""))
+GCP_LOCATION  = os.environ.get("GCP_LOCATION", "us-central1")
+SERVER_SCRIPT = Path(__file__).parent / "server.py"
+MAX_ROUNDS    = 10
+MAX_TOKENS    = 8192
 
 SYSTEM_PROMPT = """You are DockerAI, an expert DevOps assistant that manages Docker infrastructure
 through a set of MCP tools. You have full access to Docker: images, containers,
@@ -58,171 +69,137 @@ class ToolEvent:
 
 @dataclass
 class ChatMessage:
-    role: str                        # "user" | "assistant" | "tool"
+    role: str          # "user" | "assistant"
     content: str
     tool_events: list[ToolEvent] = field(default_factory=list)
 
-# ─── Gemini schema helpers ────────────────────────────────────────────────────
+# ─── Vertex AI client (ADC — no API key) ─────────────────────────────────────
 
-def _json_type_to_gemini(pdef: dict) -> genai_types.Schema:
-    jtype = pdef.get("type", "string")
-    desc  = pdef.get("description", "")
-    enum  = pdef.get("enum")
+def _detect_project() -> str:
+    """Try to get GCP project from metadata server (Cloud Run / GCE)."""
+    try:
+        req = urllib.request.Request(
+            "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as r:
+            return r.read().decode()
+    except Exception:
+        return ""
 
+
+def build_vertex_client() -> genai.Client:
+    project = GCP_PROJECT or _detect_project()
+    return genai.Client(
+        vertexai=True,
+        project=project or None,
+        location=GCP_LOCATION,
+    )
+
+# ─── Gemini schema conversion ─────────────────────────────────────────────────
+
+def _json_to_gemini(pdef: dict) -> genai_types.Schema:
+    jtype, desc, enum = pdef.get("type", "string"), pdef.get("description", ""), pdef.get("enum")
     if jtype == "object":
-        sub = {k: _json_type_to_gemini(v) for k, v in pdef.get("properties", {}).items()}
+        sub = {k: _json_to_gemini(v) for k, v in pdef.get("properties", {}).items()}
         return genai_types.Schema(type=genai_types.Type.OBJECT, description=desc, properties=sub or None)
     if jtype == "array":
         return genai_types.Schema(type=genai_types.Type.ARRAY, description=desc,
-                                   items=_json_type_to_gemini(pdef.get("items", {})))
-    if jtype == "boolean":
-        return genai_types.Schema(type=genai_types.Type.BOOLEAN, description=desc)
-    if jtype == "integer":
-        return genai_types.Schema(type=genai_types.Type.INTEGER, description=desc)
-    if jtype == "number":
-        return genai_types.Schema(type=genai_types.Type.NUMBER, description=desc)
-    if enum:
-        return genai_types.Schema(type=genai_types.Type.STRING, description=desc, enum=enum)
-    return genai_types.Schema(type=genai_types.Type.STRING, description=desc)
+                                  items=_json_to_gemini(pdef.get("items", {})))
+    type_map = {"boolean": genai_types.Type.BOOLEAN,
+                "integer": genai_types.Type.INTEGER,
+                "number":  genai_types.Type.NUMBER}
+    if jtype in type_map:
+        return genai_types.Schema(type=type_map[jtype], description=desc)
+    return genai_types.Schema(type=genai_types.Type.STRING, description=desc, enum=enum)
 
 
-def mcp_tool_to_gemini(tool) -> genai_types.FunctionDeclaration:
+def mcp_to_gemini(tool) -> genai_types.FunctionDeclaration:
     schema = tool.inputSchema or {}
-    props  = {k: _json_type_to_gemini(v) for k, v in schema.get("properties", {}).items()}
-    params = genai_types.Schema(
-        type=genai_types.Type.OBJECT,
-        properties=props,
-        required=schema.get("required", []),
-    ) if props else None
-    return genai_types.FunctionDeclaration(
-        name=tool.name,
-        description=tool.description or "",
-        parameters=params,
-    )
+    props  = {k: _json_to_gemini(v) for k, v in schema.get("properties", {}).items()}
+    params = genai_types.Schema(type=genai_types.Type.OBJECT, properties=props,
+                                required=schema.get("required", [])) if props else None
+    return genai_types.FunctionDeclaration(name=tool.name,
+                                           description=tool.description or "",
+                                           parameters=params)
 
-# ─── Core async agent (runs inside a dedicated event loop thread) ─────────────
+# ─── Async agent ──────────────────────────────────────────────────────────────
 
-async def _run_agent_turn(
-    api_key: str,
-    user_message: str,
-    gemini_history: list[genai_types.Content],
-    on_event,                          # callback(event_type, payload)
-) -> list[genai_types.Content]:
-    """
-    Full agentic turn: Gemini ↔ MCP tool calls.
-    Emits events via on_event for the UI to consume.
-    """
-    gemini = genai.Client(api_key=api_key)
-
-    server_params = StdioServerParameters(
-        command="python",
-        args=[str(SERVER_SCRIPT)],
-    )
-
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
+async def _agent_turn(user_message: str, history: list, on_event) -> list:
+    client = build_vertex_client()
+    async with stdio_client(StdioServerParameters(command="python",
+                                                   args=[str(SERVER_SCRIPT)])) as (r, w):
+        async with ClientSession(r, w) as session:
             await session.initialize()
-            mcp_tools_resp = await session.list_tools()
-            mcp_tools = mcp_tools_resp.tools
+            tools     = (await session.list_tools()).tools
+            g_tools   = [genai_types.Tool(function_declarations=[mcp_to_gemini(t) for t in tools])]
+            history.append(genai_types.Content(role="user",
+                                               parts=[genai_types.Part(text=user_message)]))
 
-            fn_decls = [mcp_tool_to_gemini(t) for t in mcp_tools]
-            gemini_tools = [genai_types.Tool(function_declarations=fn_decls)]
-
-            # Append user message to history
-            gemini_history.append(
-                genai_types.Content(role="user", parts=[genai_types.Part(text=user_message)])
-            )
-
-            for _ in range(MAX_TOOL_ROUNDS):
+            for _ in range(MAX_ROUNDS):
                 on_event("thinking", None)
-
-                response = gemini.models.generate_content(
+                resp      = client.models.generate_content(
                     model=GEMINI_MODEL,
-                    contents=gemini_history,
+                    contents=history,
                     config=genai_types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
-                        tools=gemini_tools,
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
+                        tools=g_tools,
+                        max_output_tokens=MAX_TOKENS,
                         temperature=0.2,
                     ),
                 )
+                candidate = resp.candidates[0]
+                parts     = candidate.content.parts
+                history.append(candidate.content)
 
-                candidate = response.candidates[0]
-                parts = candidate.content.parts
-                gemini_history.append(candidate.content)
+                texts    = [p.text for p in parts if p.text]
+                fn_calls = [p.function_call for p in parts if p.function_call]
 
-                text_parts = [p.text for p in parts if p.text]
-                fn_calls   = [p.function_call for p in parts if p.function_call]
-
-                if text_parts:
-                    on_event("text", "".join(text_parts))
-
+                if texts:
+                    on_event("text", "".join(texts))
                 if not fn_calls:
                     break
 
-                tool_resp_parts: list[genai_types.Part] = []
-
-                for fn_call in fn_calls:
-                    name = fn_call.name
-                    args = dict(fn_call.args) if fn_call.args else {}
+                resp_parts: list[genai_types.Part] = []
+                for fn in fn_calls:
+                    name, args = fn.name, dict(fn.args) if fn.args else {}
                     on_event("tool_call", {"name": name, "args": args})
-
                     try:
-                        mcp_result = await session.call_tool(name, args)
-                        result_text = "\n".join(
-                            b.text for b in mcp_result.content if hasattr(b, "text")
-                        ) or "(no output)"
+                        res         = await session.call_tool(name, args)
+                        result_text = "\n".join(b.text for b in res.content
+                                                if hasattr(b, "text")) or "(no output)"
                         on_event("tool_result", {"name": name, "result": result_text, "error": False})
                     except Exception as exc:
                         result_text = f"ERROR: {exc}"
                         on_event("tool_result", {"name": name, "result": result_text, "error": True})
-
-                    tool_resp_parts.append(
-                        genai_types.Part(
-                            function_response=genai_types.FunctionResponse(
-                                name=name,
-                                response={"result": result_text},
-                            )
-                        )
-                    )
-
-                gemini_history.append(
-                    genai_types.Content(role="user", parts=tool_resp_parts)
-                )
-
-    return gemini_history
+                    resp_parts.append(genai_types.Part(
+                        function_response=genai_types.FunctionResponse(
+                            name=name, response={"result": result_text})))
+                history.append(genai_types.Content(role="user", parts=resp_parts))
+    return history
 
 
-def run_agent_sync(api_key, user_message, gemini_history, event_queue) -> list:
-    """Run the async agent in a fresh event loop (called from a thread)."""
-    events_collected = []
-
-    def on_event(kind, payload):
-        events_collected.append((kind, payload))
-        event_queue.put((kind, payload))
-
+def run_agent_sync(msg: str, history: list, eq: _queue.Queue) -> list:
+    def cb(kind, payload): eq.put((kind, payload))
     loop = asyncio.new_event_loop()
+    box: dict = {}
     try:
-        new_history = loop.run_until_complete(
-            _run_agent_turn(api_key, user_message, gemini_history, on_event)
-        )
+        box["h"] = loop.run_until_complete(_agent_turn(msg, history, cb))
+    except Exception as exc:
+        eq.put(("error", str(exc)))
+        box["h"] = history
     finally:
         loop.close()
+    eq.put(("done", None))
+    return box.get("h", history)
 
-    event_queue.put(("done", None))
-    return new_history
-
-
-# ─── Helpers to fetch tools list for sidebar ─────────────────────────────────
 
 async def _fetch_tools():
-    server_params = StdioServerParameters(command="python", args=[str(SERVER_SCRIPT)])
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
+    async with stdio_client(StdioServerParameters(command="python",
+                                                   args=[str(SERVER_SCRIPT)])) as (r, w):
+        async with ClientSession(r, w) as session:
             await session.initialize()
-            resp = await session.list_tools()
-            return [(t.name, t.description or "") for t in resp.tools]
-
+            return [(t.name, t.description or "") for t in (await session.list_tools()).tools]
 
 def fetch_tools_sync():
     loop = asyncio.new_event_loop()
@@ -231,358 +208,698 @@ def fetch_tools_sync():
     finally:
         loop.close()
 
-# ─── UI helpers ───────────────────────────────────────────────────────────────
+# ─── Streamlit page ───────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="Docker MCP", page_icon="🐳",
+                   layout="wide", initial_sidebar_state="expanded")
+
+# ── Light theme CSS ───────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* base */
+html, body,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+.main .block-container { background:#f8fafc !important; color:#1e293b !important; }
+
+/* sidebar */
+[data-testid="stSidebar"] {
+    background:#ffffff !important;
+    border-right:1px solid #e2e8f0 !important;
+}
+[data-testid="stSidebar"] * { color:#334155 !important; }
+[data-testid="stSidebar"] h2,
+[data-testid="stSidebar"] h3 { color:#0f172a !important; font-weight:700; }
+
+/* sidebar buttons */
+[data-testid="stSidebar"] .stButton button {
+    background:#f1f5f9 !important; border:1px solid #e2e8f0 !important;
+    color:#334155 !important; border-radius:8px !important;
+    font-size:.84rem !important; transition:all .15s;
+}
+[data-testid="stSidebar"] .stButton button:hover {
+    background:#e0f2fe !important; border-color:#38bdf8 !important; color:#0369a1 !important;
+}
+
+/* header */
+.dock-header {
+    display:flex; align-items:center; gap:14px;
+    padding:20px 0 12px; border-bottom:2px solid #e2e8f0; margin-bottom:24px;
+}
+.dock-header h1 { margin:0; font-size:1.7rem; color:#0284c7; font-weight:800; }
+.dock-badge {
+    background:linear-gradient(135deg,#0284c7,#0ea5e9);
+    color:#fff; font-size:.7rem; padding:3px 10px; border-radius:20px;
+    font-weight:700; letter-spacing:.06em;
+    box-shadow:0 1px 4px rgba(2,132,199,.3);
+}
+
+/* chat bubbles */
+[data-testid="stChatMessage"] {
+    background:#ffffff !important; border:1px solid #e2e8f0 !important;
+    border-radius:12px !important; margin-bottom:10px !important;
+    box-shadow:0 1px 3px rgba(0,0,0,.05) !important;
+}
+
+/* tool expanders */
+[data-testid="stExpander"] {
+    background:#f0f9ff !important; border:1px solid #bae6fd !important;
+    border-radius:8px !important; margin-bottom:6px !important;
+}
+[data-testid="stExpander"] summary {
+    color:#0369a1 !important; font-size:.85rem !important; font-weight:600 !important;
+}
+
+/* chat input */
+[data-testid="stChatInput"] textarea {
+    background:#ffffff !important; border:1.5px solid #cbd5e1 !important;
+    border-radius:12px !important; color:#1e293b !important; font-size:.95rem !important;
+    box-shadow:0 1px 4px rgba(0,0,0,.06) !important;
+}
+[data-testid="stChatInput"] textarea:focus {
+    border-color:#0284c7 !important; box-shadow:0 0 0 3px rgba(2,132,199,.15) !important;
+}
+
+/* text inputs */
+.stTextInput input {
+    background:#fff !important; border:1.5px solid #cbd5e1 !important;
+    border-radius:8px !important; color:#1e293b !important;
+}
+.stTextInput input:focus { border-color:#0284c7 !important; }
+
+/* code */
+pre, code {
+    background:#f1f5f9 !important; color:#0f172a !important;
+    border:1px solid #e2e8f0 !important;
+}
+
+/* tool cards */
+.tool-card {
+    background:#f8fafc; border:1px solid #e2e8f0; border-left:3px solid #0284c7;
+    border-radius:6px; padding:7px 11px; margin-bottom:5px; font-size:.78rem;
+}
+.tool-name { color:#0284c7; font-weight:700; font-family:monospace; }
+.tool-desc { color:#64748b; margin-top:2px; line-height:1.4; }
+
+/* status */
+.s-ok  { color:#16a34a; font-size:.8rem; font-weight:600; }
+.s-err { color:#dc2626; font-size:.8rem; font-weight:600; }
+
+/* clear btn */
+.clear-btn button {
+    background:#fff1f2 !important; border:1px solid #fca5a5 !important;
+    color:#dc2626 !important; border-radius:8px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Session state ────────────────────────────────────────────────────────────
+for k, v in [("messages", []), ("gemini_history", []),
+             ("tools_cache", None), ("processing", False)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ─── Sidebar ─────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🐳 Docker MCP")
+
+    # ── Vertex AI status ──────────────────────────────────────────────────────
+    st.markdown(
+        f"""<div style="background:#f0fdf4;border:1px solid #bbf7d0;
+                        border-radius:8px;padding:10px 14px;margin-bottom:8px">
+            <div class="s-ok">● Vertex AI — ADC</div>
+            <div style="color:#64748b;font-size:.75rem;margin-top:3px">
+                No API key · Application Default Credentials
+            </div>
+            <div style="color:#94a3b8;font-size:.72rem;margin-top:2px">
+                Project: <b>{GCP_PROJECT or "auto-detect"}</b> &nbsp;·&nbsp;
+                Region: <b>{GCP_LOCATION}</b>
+            </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── Docker host status ────────────────────────────────────────────────────
+    _docker_host = os.environ.get("DOCKER_HOST", "")
+    if _docker_host:
+        st.markdown(
+            f"""<div style="background:#f0fdf4;border:1px solid #bbf7d0;
+                            border-radius:8px;padding:10px 14px;margin-bottom:8px">
+                <div class="s-ok">● Docker Daemon — TCP</div>
+                <div style="color:#94a3b8;font-size:.72rem;margin-top:3px;
+                            word-break:break-all;font-family:monospace">
+                    {_docker_host}
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """<div style="background:#fff7ed;border:1px solid #fed7aa;
+                           border-radius:8px;padding:10px 14px;margin-bottom:8px">
+                <div style="color:#c2410c;font-size:.8rem;font-weight:600">
+                    ⚠ DOCKER_HOST not set
+                </div>
+                <div style="color:#64748b;font-size:.74rem;margin-top:5px;line-height:1.6">
+                    Set this env var in Cloud Run:<br>
+                    <code style="background:#fef3c7;padding:2px 5px;border-radius:4px;
+                                 font-size:.7rem;color:#92400e">
+                        DOCKER_HOST=tcp://YOUR_VM_IP:2375
+                    </code><br>
+                    Run <b>docker-daemon-setup.sh</b> on your VM first.
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+    st.markdown("### ⚡ Quick Actions")
+    for label, prompt in [
+        ("📋 List images",     "List all local Docker images with their sizes and tags."),
+        ("🐋 List containers", "Show all running containers with their status and ports."),
+        ("💾 List volumes",    "List all Docker volumes."),
+        ("🌐 List networks",   "List all Docker networks."),
+        ("📊 System info",     "Show Docker system info and resource usage."),
+        ("🧹 Disk usage",      "Show Docker disk usage breakdown."),
+    ]:
+        if st.button(label, use_container_width=True, disabled=st.session_state.processing):
+            st.session_state["pending_prompt"] = prompt
+
+    st.markdown("---")
+    st.markdown("### 🔧 Tools")
+    c1, c2 = st.columns([4, 1])
+    with c2:
+        if st.button("↺", help="Refresh"):
+            st.session_state.tools_cache = None
+
+    if st.session_state.tools_cache is None:
+        with st.spinner("Connecting…"):
+            try:
+                st.session_state.tools_cache = fetch_tools_sync()
+                with c1:
+                    st.markdown('<span class="s-ok">● Connected</span>', unsafe_allow_html=True)
+            except Exception as e:
+                st.session_state.tools_cache = []
+                with c1:
+                    st.markdown(f'<span class="s-err">● {str(e)[:45]}</span>', unsafe_allow_html=True)
+
+    cats = {
+        "📦 Images":     [t for t in (st.session_state.tools_cache or []) if "image"     in t[0]],
+        "🐋 Containers": [t for t in (st.session_state.tools_cache or []) if "container" in t[0]],
+        "🌐 Networks":   [t for t in (st.session_state.tools_cache or []) if "network"   in t[0]],
+        "💾 Volumes":    [t for t in (st.session_state.tools_cache or []) if "volume"    in t[0]],
+        "⚙️ System":     [t for t in (st.session_state.tools_cache or [])
+                          if "system" in t[0] or "compose" in t[0]],
+    }
+    for cat, tools in cats.items():
+        if not tools:
+            continue
+        with st.expander(f"{cat} ({len(tools)})", expanded=False):
+            for name, desc in tools:
+                st.markdown(
+                    f'<div class="tool-card"><div class="tool-name">{name}</div>'
+                    f'<div class="tool-desc">{desc[:72]}{"…" if len(desc)>72 else ""}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown("---")
+    st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
+    if st.button("🗑️ Clear conversation", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.gemini_history = []
+        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="color:#94a3b8;font-size:.72rem;margin-top:10px">'
+        f'{GEMINI_MODEL} · Vertex AI · MCP stdio</div>',
+        unsafe_allow_html=True,
+    )
+
+# ─── Beautiful result renderers ───────────────────────────────────────────────
+
+def _status_badge(status: str) -> str:
+    colors = {
+        "running":  ("#dcfce7", "#16a34a", "▶"),
+        "exited":   ("#fee2e2", "#dc2626", "■"),
+        "paused":   ("#fef9c3", "#ca8a04", "⏸"),
+        "created":  ("#e0f2fe", "#0284c7", "○"),
+        "dead":     ("#fecaca", "#991b1b", "✕"),
+    }
+    bg, fg, icon = colors.get(status.lower(), ("#f1f5f9", "#64748b", "?"))
+    return (f'<span style="background:{bg};color:{fg};padding:2px 8px;border-radius:20px;'
+            f'font-size:.72rem;font-weight:700">{icon} {status}</span>')
+
+
+def _tag_chip(tag: str, bg="#e0f2fe", fg="#0369a1") -> str:
+    return (f'<span style="background:{bg};color:{fg};padding:2px 8px;border-radius:4px;'
+            f'font-size:.72rem;font-family:monospace;margin-right:4px">{tag}</span>')
+
+
+def _render_image_list(data: list) -> None:
+    st.markdown(f'<div style="color:#64748b;font-size:.8rem;margin-bottom:10px">'
+                f'<b>{len(data)}</b> images found</div>', unsafe_allow_html=True)
+    for img in data:
+        tags = img.get("tags") or ["<none>"]
+        primary = tags[0]
+        extra   = tags[1:]
+        created = img.get("created", "")[:10]
+        arch    = img.get("architecture", "")
+        size    = img.get("size", "")
+        img_id  = img.get("id", "")[:14]
+
+        tag_html = "".join(_tag_chip(t) for t in tags)
+        extra_html = ""
+        if extra:
+            extra_html = "".join(_tag_chip(t, "#f1f5f9", "#64748b") for t in extra)
+
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+                    padding:12px 16px;margin-bottom:8px;
+                    box-shadow:0 1px 3px rgba(0,0,0,.04)">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start">
+                <div>
+                    <div style="font-weight:700;color:#0f172a;font-size:.95rem;
+                                font-family:monospace">{primary}</div>
+                    <div style="margin-top:5px">{tag_html}{extra_html}</div>
+                </div>
+                <div style="text-align:right;flex-shrink:0;margin-left:16px">
+                    <div style="font-size:1rem;font-weight:700;color:#0284c7">{size}</div>
+                    <div style="color:#94a3b8;font-size:.72rem;margin-top:2px">{created}</div>
+                </div>
+            </div>
+            <div style="margin-top:8px;color:#94a3b8;font-size:.72rem">
+                ID: <code style="background:#f1f5f9;padding:1px 5px;border-radius:3px">{img_id}</code>
+                &nbsp;·&nbsp; {arch}
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_container_list(data: list) -> None:
+    st.markdown(f'<div style="color:#64748b;font-size:.8rem;margin-bottom:10px">'
+                f'<b>{len(data)}</b> containers</div>', unsafe_allow_html=True)
+    for c in data:
+        name    = c.get("name", "?")
+        status  = c.get("status", "unknown")
+        image   = c.get("image", "")
+        cid     = c.get("id", "")[:12]
+        created = c.get("created", "")[:10]
+        ports   = c.get("ports", {})
+        nets    = c.get("networks", [])
+
+        port_html = ""
+        for proto, host_ports in ports.items():
+            for hp in (host_ports or []):
+                port_html += _tag_chip(f"{hp}→{proto}", "#f0fdf4", "#16a34a")
+
+        net_html = "".join(_tag_chip(n, "#faf5ff", "#7c3aed") for n in nets)
+
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+                    padding:12px 16px;margin-bottom:8px;
+                    box-shadow:0 1px 3px rgba(0,0,0,.04)">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <div style="font-weight:700;color:#0f172a;font-size:.95rem">{name}</div>
+                <div>{_status_badge(status)}</div>
+            </div>
+            <div style="color:#64748b;font-size:.8rem;margin-top:4px;font-family:monospace">{image}</div>
+            <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:4px">
+                {port_html}{net_html}
+            </div>
+            <div style="margin-top:6px;color:#94a3b8;font-size:.72rem">
+                ID: <code style="background:#f1f5f9;padding:1px 5px;border-radius:3px">{cid}</code>
+                &nbsp;·&nbsp; created {created}
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_volume_list(data: list) -> None:
+    st.markdown(f'<div style="color:#64748b;font-size:.8rem;margin-bottom:10px">'
+                f'<b>{len(data)}</b> volumes</div>', unsafe_allow_html=True)
+    for v in data:
+        name   = v.get("name", "?")
+        driver = v.get("driver", "local")
+        mount  = v.get("mountpoint", "")
+        created = v.get("created", "")[:10] if v.get("created") else ""
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+                    padding:12px 16px;margin-bottom:6px;
+                    box-shadow:0 1px 3px rgba(0,0,0,.04)">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <div style="font-weight:700;color:#0f172a;font-family:monospace;font-size:.88rem">{name}</div>
+                {_tag_chip(driver, "#faf5ff", "#7c3aed")}
+            </div>
+            <div style="color:#94a3b8;font-size:.72rem;margin-top:6px;font-family:monospace;
+                        word-break:break-all">{mount}</div>
+            {"<div style='color:#94a3b8;font-size:.72rem;margin-top:2px'>created " + created + "</div>" if created else ""}
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_network_list(data: list) -> None:
+    st.markdown(f'<div style="color:#64748b;font-size:.8rem;margin-bottom:10px">'
+                f'<b>{len(data)}</b> networks</div>', unsafe_allow_html=True)
+    for n in data:
+        name     = n.get("name", "?")
+        driver   = n.get("driver", "")
+        scope    = n.get("scope", "")
+        internal = n.get("internal", False)
+        conts    = n.get("containers", [])
+        badge    = _tag_chip(driver, "#e0f2fe", "#0369a1")
+        scope_b  = _tag_chip(scope, "#f1f5f9", "#64748b")
+        int_b    = _tag_chip("internal", "#fff7ed", "#c2410c") if internal else ""
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+                    padding:12px 16px;margin-bottom:6px;
+                    box-shadow:0 1px 3px rgba(0,0,0,.04)">
+            <div style="display:flex;justify-content:space-between;align-items:center">
+                <div style="font-weight:700;color:#0f172a;font-size:.9rem">{name}</div>
+                <div>{badge}{scope_b}{int_b}</div>
+            </div>
+            {"<div style='color:#94a3b8;font-size:.72rem;margin-top:6px'>" + str(len(conts)) + " container(s) attached</div>" if conts else ""}
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_stats(data: dict) -> None:
+    metrics = [
+        ("🖥️ CPU",    data.get("cpu_percent", 0),    f"{data.get('cpu_percent', 0)}%",         100,  "#0284c7"),
+        ("💾 Memory", data.get("memory_percent", 0), data.get("memory_usage", ""),              100,  "#7c3aed"),
+    ]
+    st.markdown(f'<div style="font-weight:700;color:#0f172a;margin-bottom:10px">'
+                f'📊 {data.get("container", "")}</div>', unsafe_allow_html=True)
+
+    cols = st.columns(2)
+    for i, (label, pct, val, max_val, color) in enumerate(metrics):
+        bar_w = min(int(float(pct)), 100)
+        with cols[i]:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;
+                        padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.04)">
+                <div style="color:#64748b;font-size:.8rem">{label}</div>
+                <div style="font-size:1.4rem;font-weight:800;color:{color};margin:4px 0">{val}</div>
+                <div style="background:#f1f5f9;border-radius:4px;height:6px;margin-top:6px">
+                    <div style="background:{color};width:{bar_w}%;height:6px;border-radius:4px"></div>
+                </div>
+                <div style="color:#94a3b8;font-size:.7rem;margin-top:3px">{pct}%</div>
+            </div>""", unsafe_allow_html=True)
+
+    # Network + Block IO row
+    net_cols = st.columns(4)
+    for col, (label, val) in zip(net_cols, [
+        ("⬇ Net RX",    data.get("network_rx", "0 B")),
+        ("⬆ Net TX",    data.get("network_tx", "0 B")),
+        ("📖 Disk Read", data.get("block_read", "0 B")),
+        ("✏ Disk Write", data.get("block_write", "0 B")),
+    ]):
+        with col:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;
+                        padding:10px 12px;box-shadow:0 1px 3px rgba(0,0,0,.04)">
+                <div style="color:#94a3b8;font-size:.72rem">{label}</div>
+                <div style="font-size:.95rem;font-weight:700;color:#0f172a;margin-top:2px">{val}</div>
+            </div>""", unsafe_allow_html=True)
+
+
+def _render_system_info(data: dict) -> None:
+    cards = [
+        ("🐳 Docker",     data.get("docker_version", ""), "version"),
+        ("🖥️ OS",         data.get("operating_system", ""), ""),
+        ("⚙️ Arch",       data.get("architecture", ""), ""),
+        ("🧠 Memory",     data.get("memory", ""), ""),
+        ("💻 CPUs",       str(data.get("cpus", "")), ""),
+        ("📦 Images",     str(data.get("images", "")), ""),
+        ("🐋 Containers", str(data.get("containers", "")), ""),
+        ("▶ Running",    str(data.get("containers_running", "")), ""),
+        ("💽 Storage",    data.get("storage_driver", ""), "driver"),
+        ("🐧 Kernel",     data.get("kernel_version", ""), ""),
+    ]
+    cols = st.columns(3)
+    for i, (label, val, hint) in enumerate(cards):
+        with cols[i % 3]:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;
+                        padding:12px;margin-bottom:8px;box-shadow:0 1px 3px rgba(0,0,0,.04)">
+                <div style="color:#94a3b8;font-size:.72rem">{label}</div>
+                <div style="font-size:.92rem;font-weight:700;color:#0f172a;margin-top:3px;
+                            word-break:break-all">{val or "—"}</div>
+            </div>""", unsafe_allow_html=True)
+
+
+def _render_inspect(data: dict) -> None:
+    """Generic inspect view — key/value grid."""
+    skip = {"full_id", "labels"}
+    items = [(k, v) for k, v in data.items() if k not in skip and v not in (None, "", [], {})]
+    cols = st.columns(2)
+    for i, (k, v) in enumerate(items):
+        val = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
+        with cols[i % 2]:
+            st.markdown(f"""
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;
+                        padding:10px 12px;margin-bottom:6px">
+                <div style="color:#94a3b8;font-size:.72rem;text-transform:uppercase;
+                            letter-spacing:.05em">{k.replace("_", " ")}</div>
+                <div style="font-size:.85rem;font-weight:600;color:#0f172a;margin-top:3px;
+                            word-break:break-all;font-family:monospace">{val[:120]}</div>
+            </div>""", unsafe_allow_html=True)
+
+
+def _render_history(rows: list) -> None:
+    st.markdown(f'<div style="color:#64748b;font-size:.8rem;margin-bottom:8px">'
+                f'<b>{len(rows)}</b> layers</div>', unsafe_allow_html=True)
+    for row in rows:
+        size    = row.get("size", "")
+        cmd     = row.get("created_by", "")
+        created = row.get("created", "")[:10]
+        lid     = row.get("id", "")[:12]
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;
+                    padding:9px 13px;margin-bottom:4px;font-size:.78rem">
+            <div style="display:flex;justify-content:space-between">
+                <code style="color:#0369a1;background:#e0f2fe;padding:1px 6px;
+                             border-radius:3px">{lid or "<missing>"}</code>
+                <span style="color:#0284c7;font-weight:700">{size}</span>
+            </div>
+            <div style="color:#475569;margin-top:5px;font-family:monospace;
+                        white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{cmd}</div>
+            <div style="color:#94a3b8;margin-top:3px">{created}</div>
+        </div>""", unsafe_allow_html=True)
+
+
+def _render_plain_text(text: str) -> None:
+    """Render plain-text output (logs, exec, prune results) cleanly."""
+    # Success banner
+    if text.startswith("✅"):
+        lines = text.split("\n")
+        rest  = "\n".join(lines[1:]).strip()
+        st.markdown(f"""
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;
+                    padding:10px 14px;margin-bottom:8px">
+            <div style="color:#16a34a;font-weight:700">{lines[0]}</div>
+            {"<pre style='margin:8px 0 0;font-size:.78rem;color:#374151;white-space:pre-wrap'>" + rest + "</pre>" if rest else ""}
+        </div>""", unsafe_allow_html=True)
+    elif text.startswith("❌"):
+        st.markdown(f"""
+        <div style="background:#fff1f2;border:1px solid #fca5a5;border-radius:8px;
+                    padding:10px 14px">
+            <div style="color:#dc2626;font-weight:700;white-space:pre-wrap">{text[:2000]}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.code(text[:6000], language="text")
+
+
+# ─── Smart result dispatcher ──────────────────────────────────────────────────
+
+def _render_result(tool_name: str, result: str) -> None:
+    """Parse result and dispatch to the right beautiful renderer."""
+    try:
+        data = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        _render_plain_text(result)
+        return
+
+    # List results
+    if isinstance(data, list) and data:
+        first = data[0] if isinstance(data[0], dict) else {}
+        if "tags" in first and "size" in first:
+            _render_image_list(data); return
+        if "status" in first and "image" in first:
+            _render_container_list(data); return
+        if "mountpoint" in first or "driver" in first and "labels" in first:
+            _render_volume_list(data); return
+        if "driver" in first and "scope" in first:
+            _render_network_list(data); return
+        if "created_by" in first:
+            _render_history(data); return
+
+    # Single dict results
+    if isinstance(data, dict):
+        if "cpu_percent" in data:
+            _render_stats(data); return
+        if "docker_version" in data or "containers_running" in data:
+            _render_system_info(data); return
+        if "id" in data and ("tags" in data or "status" in data):
+            _render_inspect(data); return
+
+    # Fallback: pretty JSON
+    st.json(data)
+
+
+# ─── Tool event renderer ──────────────────────────────────────────────────────
 
 def render_tool_event(ev: ToolEvent):
     if ev.result is None:
-        # Still pending
-        with st.expander(f"🔧 `{ev.tool_name}`", expanded=False):
-            st.json(ev.args)
+        with st.expander(f"🔧 `{ev.tool_name}` — calling…", expanded=True):
+            if ev.args:
+                st.json(ev.args)
         return
 
     icon  = "✅" if not ev.error else "❌"
     label = f"{icon} `{ev.tool_name}`"
-    with st.expander(label, expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.caption("**Arguments**")
-            st.json(ev.args)
-        with col2:
-            st.caption("**Result**")
-            try:
-                parsed = json.loads(ev.result)
-                st.json(parsed)
-            except (json.JSONDecodeError, TypeError):
-                st.code(ev.result[:4000], language="text")
+
+    with st.expander(label, expanded=True):
+        # Args pill row
+        if ev.args:
+            args_html = " ".join(
+                f'<span style="background:#f1f5f9;border:1px solid #e2e8f0;'
+                f'padding:2px 8px;border-radius:4px;font-size:.72rem;font-family:monospace;'
+                f'color:#334155"><b>{k}</b>: {str(v)[:40]}</span>'
+                for k, v in ev.args.items()
+            )
+            st.markdown(f'<div style="margin-bottom:10px">{args_html}</div>',
+                        unsafe_allow_html=True)
+
+        # Render result beautifully
+        _render_result(ev.tool_name, ev.result)
 
 
 def render_message(msg: ChatMessage):
     if msg.role == "user":
         with st.chat_message("user"):
             st.markdown(msg.content)
-    elif msg.role == "assistant":
+    else:
         with st.chat_message("assistant", avatar="🐳"):
             for ev in msg.tool_events:
                 render_tool_event(ev)
             if msg.content:
                 st.markdown(msg.content)
 
-
-# ─── Page setup ──────────────────────────────────────────────────────────────
-
-st.set_page_config(
-    page_title="Docker MCP",
-    page_icon="🐳",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-/* ── global ── */
-[data-testid="stAppViewContainer"] { background: #0d1117; }
-[data-testid="stSidebar"]          { background: #161b22; border-right: 1px solid #30363d; }
-[data-testid="stSidebar"] *        { color: #c9d1d9 !important; }
-
-/* ── header ── */
-.dock-header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 16px 0 8px 0; border-bottom: 1px solid #21262d; margin-bottom: 20px;
-}
-.dock-header h1 { margin: 0; font-size: 1.6rem; color: #58a6ff; }
-.dock-badge {
-    background: #1f6feb; color: #fff; font-size: 0.7rem;
-    padding: 2px 8px; border-radius: 12px; font-weight: 600; letter-spacing: .05em;
-}
-
-/* ── chat messages ── */
-[data-testid="stChatMessage"] {
-    background: #161b22 !important;
-    border: 1px solid #21262d !important;
-    border-radius: 10px !important;
-    margin-bottom: 10px !important;
-}
-
-/* ── expander (tool events) ── */
-[data-testid="stExpander"] {
-    background: #0d1117 !important;
-    border: 1px solid #30363d !important;
-    border-radius: 8px !important;
-    margin-bottom: 6px !important;
-}
-[data-testid="stExpander"] summary { color: #8b949e !important; font-size: 0.85rem; }
-
-/* ── chat input ── */
-[data-testid="stChatInput"] textarea {
-    background: #161b22 !important;
-    border: 1px solid #30363d !important;
-    color: #c9d1d9 !important;
-    border-radius: 10px !important;
-}
-[data-testid="stChatInput"] textarea:focus { border-color: #58a6ff !important; }
-
-/* ── code blocks ── */
-pre, code { background: #0d1117 !important; }
-
-/* ── sidebar tool list ── */
-.tool-item {
-    background: #0d1117;
-    border: 1px solid #21262d;
-    border-radius: 6px;
-    padding: 6px 10px;
-    margin-bottom: 5px;
-    font-size: 0.78rem;
-}
-.tool-name { color: #79c0ff; font-weight: 600; font-family: monospace; }
-.tool-desc { color: #8b949e; margin-top: 2px; }
-
-/* ── status badge ── */
-.status-connected { color: #3fb950; font-size: 0.8rem; font-weight: 600; }
-.status-error     { color: #f85149; font-size: 0.8rem; font-weight: 600; }
-</style>
-""", unsafe_allow_html=True)
-
-# ─── Session state init ───────────────────────────────────────────────────────
-
-if "messages"        not in st.session_state: st.session_state.messages        = []
-if "gemini_history"  not in st.session_state: st.session_state.gemini_history  = []
-if "api_key"         not in st.session_state: st.session_state.api_key         = os.environ.get("GEMINI_API_KEY", "")
-if "tools_cache"     not in st.session_state: st.session_state.tools_cache     = None
-if "processing"      not in st.session_state: st.session_state.processing      = False
-
-# ─── Sidebar ─────────────────────────────────────────────────────────────────
-
-with st.sidebar:
-    st.markdown("## 🐳 Docker MCP")
-    st.markdown("---")
-
-    # API key input
-    api_key_input = st.text_input(
-        "Gemini API Key",
-        value=st.session_state.api_key,
-        type="password",
-        placeholder="AIza...",
-        help="Get your key at https://aistudio.google.com/app/apikey",
-    )
-    if api_key_input:
-        st.session_state.api_key = api_key_input
-
-    st.markdown("---")
-
-    # Quick actions
-    st.markdown("### ⚡ Quick Actions")
-    quick_prompts = [
-        ("📋 List images",        "List all local Docker images with their sizes and tags."),
-        ("🐋 List containers",    "Show all running containers with their status and ports."),
-        ("💾 List volumes",       "List all Docker volumes."),
-        ("🌐 List networks",      "List all Docker networks."),
-        ("📊 System info",        "Show Docker system info and resource usage."),
-        ("🧹 Disk usage",         "Show Docker disk usage breakdown."),
-    ]
-    for label, prompt in quick_prompts:
-        if st.button(label, use_container_width=True, disabled=st.session_state.processing):
-            st.session_state["pending_prompt"] = prompt
-
-    st.markdown("---")
-
-    # Tools list
-    st.markdown("### 🔧 Available Tools")
-
-    if st.button("🔄 Refresh tools", use_container_width=True):
-        st.session_state.tools_cache = None
-
-    if st.session_state.tools_cache is None:
-        with st.spinner("Loading tools…"):
-            try:
-                st.session_state.tools_cache = fetch_tools_sync()
-                st.markdown('<p class="status-connected">● MCP server connected</p>', unsafe_allow_html=True)
-            except Exception as e:
-                st.session_state.tools_cache = []
-                st.markdown(f'<p class="status-error">● MCP error: {str(e)[:60]}</p>', unsafe_allow_html=True)
-
-    if st.session_state.tools_cache:
-        # Group tools by category
-        categories = {
-            "Images":     [t for t in st.session_state.tools_cache if "image" in t[0]],
-            "Containers": [t for t in st.session_state.tools_cache if "container" in t[0]],
-            "Networks":   [t for t in st.session_state.tools_cache if "network" in t[0]],
-            "Volumes":    [t for t in st.session_state.tools_cache if "volume" in t[0]],
-            "System":     [t for t in st.session_state.tools_cache if "system" in t[0] or "compose" in t[0]],
-        }
-        for cat, tools in categories.items():
-            if tools:
-                with st.expander(f"**{cat}** ({len(tools)})", expanded=False):
-                    for name, desc in tools:
-                        st.markdown(
-                            f'<div class="tool-item">'
-                            f'<div class="tool-name">{name}</div>'
-                            f'<div class="tool-desc">{desc[:70]}{"…" if len(desc)>70 else ""}</div>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-    st.markdown("---")
-
-    # Clear chat
-    if st.button("🗑️ Clear conversation", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.gemini_history = []
-        st.rerun()
-
-    st.markdown(
-        '<div style="color:#8b949e;font-size:0.72rem;margin-top:8px">'
-        'gemini-2.5-flash · MCP stdio · docker-py 7.x'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ─── Main area ────────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 st.markdown(
-    '<div class="dock-header">'
-    '<span style="font-size:2rem">🐳</span>'
+    '<div class="dock-header"><span style="font-size:2rem">🐳</span>'
     '<h1>Docker MCP</h1>'
-    '<span class="dock-badge">Gemini 2.5 Flash</span>'
-    '</div>',
+    '<span class="dock-badge">Gemini 2.5 Flash · Vertex AI</span></div>',
     unsafe_allow_html=True,
 )
 
-# Render existing conversation
 for msg in st.session_state.messages:
     render_message(msg)
 
-# ── Handle pending quick-action prompt ───────────────────────────────────────
-pending = st.session_state.pop("pending_prompt", None)
-
-# ── Chat input ────────────────────────────────────────────────────────────────
-user_input = st.chat_input(
-    "Ask anything about your Docker environment…",
-    disabled=st.session_state.processing,
-)
-
+pending    = st.session_state.pop("pending_prompt", None)
+user_input = st.chat_input("Ask anything about your Docker environment…",
+                            disabled=st.session_state.processing)
 prompt = pending or user_input
 
-if prompt and st.session_state.api_key and not st.session_state.processing:
-    # Add user message to display
-    user_msg = ChatMessage(role="user", content=prompt)
-    st.session_state.messages.append(user_msg)
-
+if prompt and not st.session_state.processing:
+    st.session_state.messages.append(ChatMessage(role="user", content=prompt))
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Placeholder for assistant response
     with st.chat_message("assistant", avatar="🐳"):
-        status_placeholder = st.empty()
-        tool_placeholder   = st.empty()
-        text_placeholder   = st.empty()
+        status_ph = st.empty()
+        tools_ph  = st.empty()
+        text_ph   = st.empty()
 
-        status_placeholder.markdown("*🤔 Thinking…*")
-
-        # Collect events from the agent thread
-        import queue as _queue
-        event_queue = _queue.Queue()
-
-        # Build a mutable copy of history for the thread
-        history_copy = list(st.session_state.gemini_history)
-
-        agent_result: dict = {}
-
-        def _thread_target():
-            new_hist = run_agent_sync(
-                api_key=st.session_state.api_key,
-                user_message=prompt,
-                gemini_history=history_copy,
-                event_queue=event_queue,
+        def _status(html: str):
+            status_ph.markdown(
+                f'<div style="color:#0284c7;font-style:italic;font-size:.88rem">{html}</div>',
+                unsafe_allow_html=True,
             )
-            agent_result["history"] = new_hist
 
-        thread = threading.Thread(target=_thread_target, daemon=True)
-        thread.start()
+        _status("🤔 Gemini is thinking…")
 
-        # Drain event queue, updating UI
-        assistant_msg = ChatMessage(role="assistant", content="")
-        current_tool_ev: ToolEvent | None = None
+        eq           = _queue.Queue()
+        history_copy = list(st.session_state.gemini_history)
+        box: dict    = {}
+
+        def _thread():
+            box["h"] = run_agent_sync(prompt, history_copy, eq)
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+        asst_msg   = ChatMessage(role="assistant", content="")
+        cur_ev: ToolEvent | None = None
         final_text = ""
 
         while True:
             try:
-                kind, payload = event_queue.get(timeout=0.1)
+                kind, payload = eq.get(timeout=0.15)
             except _queue.Empty:
-                # Keep spinner alive
                 continue
 
             if kind == "done":
                 break
-
+            elif kind == "error":
+                status_ph.error(f"❌ {payload}")
+                break
             elif kind == "thinking":
-                status_placeholder.markdown("*🤔 Gemini is thinking…*")
-
+                _status("🤔 Gemini is thinking…")
             elif kind == "text":
                 final_text = payload
-                status_placeholder.empty()
-                text_placeholder.markdown(payload)
-
+                status_ph.empty()
+                text_ph.markdown(payload)
             elif kind == "tool_call":
-                status_placeholder.markdown(f"*🔧 Calling `{payload['name']}`…*")
+                _status(f'🔧 Calling <code>{payload["name"]}</code>…')
                 ev = ToolEvent(tool_name=payload["name"], args=payload["args"])
-                assistant_msg.tool_events.append(ev)
-                current_tool_ev = ev
-                # Re-render all tool events so far
-                with tool_placeholder.container():
-                    for e in assistant_msg.tool_events:
+                asst_msg.tool_events.append(ev)
+                cur_ev = ev
+                with tools_ph.container():
+                    for e in asst_msg.tool_events:
                         render_tool_event(e)
-
             elif kind == "tool_result":
-                if current_tool_ev and current_tool_ev.tool_name == payload["name"]:
-                    current_tool_ev.result = payload["result"]
-                    current_tool_ev.error  = payload["error"]
-                status_placeholder.markdown("*🤔 Processing result…*")
-                with tool_placeholder.container():
-                    for e in assistant_msg.tool_events:
+                if cur_ev and cur_ev.tool_name == payload["name"]:
+                    cur_ev.result = payload["result"]
+                    cur_ev.error  = payload["error"]
+                _status("⚙️ Processing result…")
+                with tools_ph.container():
+                    for e in asst_msg.tool_events:
                         render_tool_event(e)
 
-        thread.join()
-        status_placeholder.empty()
-
-        # Finalise assistant message
-        assistant_msg.content = final_text
-        st.session_state.messages.append(assistant_msg)
-        st.session_state.gemini_history = agent_result.get("history", history_copy)
-
-        # Final render
-        with tool_placeholder.container():
-            for ev in assistant_msg.tool_events:
+        status_ph.empty()
+        asst_msg.content = final_text
+        st.session_state.messages.append(asst_msg)
+        st.session_state.gemini_history = box.get("h", history_copy)
+        with tools_ph.container():
+            for ev in asst_msg.tool_events:
                 render_tool_event(ev)
-        text_placeholder.markdown(final_text)
+        text_ph.markdown(final_text)
 
-elif prompt and not st.session_state.api_key:
-    st.warning("⚠️ Please enter your **Gemini API Key** in the sidebar first.")
-
-# ── Empty state hint ─────────────────────────────────────────────────────────
+# ─── Empty state ─────────────────────────────────────────────────────────────
 if not st.session_state.messages:
     st.markdown("""
-<div style="text-align:center;padding:60px 20px;color:#8b949e">
+<div style="text-align:center;padding:64px 20px;color:#64748b">
     <div style="font-size:4rem;margin-bottom:16px">🐳</div>
-    <h3 style="color:#c9d1d9;margin-bottom:8px">Docker MCP Assistant</h3>
-    <p style="max-width:480px;margin:0 auto;line-height:1.6">
-        Ask anything in plain English — pull images, run containers, tail logs,
-        inspect stats, manage volumes & networks, build from a Dockerfile, and more.
+    <h3 style="color:#0f172a;margin-bottom:8px;font-weight:800">Docker MCP Assistant</h3>
+    <p style="max-width:500px;margin:0 auto;line-height:1.7;color:#475569">
+        Ask anything in plain English — pull images, run containers,
+        tail logs, inspect stats, manage volumes &amp; networks,
+        build from a Dockerfile, and more.
     </p>
-    <div style="margin-top:28px;display:flex;flex-wrap:wrap;gap:10px;justify-content:center">
-        <code style="background:#161b22;border:1px solid #30363d;padding:6px 12px;border-radius:6px;font-size:0.82rem">
+    <div style="margin-top:32px;display:flex;flex-wrap:wrap;gap:10px;justify-content:center">
+        <span style="background:#e0f2fe;border:1px solid #bae6fd;color:#0369a1;
+                     padding:8px 16px;border-radius:20px;font-size:.83rem;font-weight:500">
             Pull nginx:alpine and run it on port 8080
-        </code>
-        <code style="background:#161b22;border:1px solid #30363d;padding:6px 12px;border-radius:6px;font-size:0.82rem">
-            Show me stats for all running containers
-        </code>
-        <code style="background:#161b22;border:1px solid #30363d;padding:6px 12px;border-radius:6px;font-size:0.82rem">
-            Build an image from this Dockerfile: …
-        </code>
-        <code style="background:#161b22;border:1px solid #30363d;padding:6px 12px;border-radius:6px;font-size:0.82rem">
-            Prune all stopped containers and dangling images
-        </code>
+        </span>
+        <span style="background:#e0f2fe;border:1px solid #bae6fd;color:#0369a1;
+                     padding:8px 16px;border-radius:20px;font-size:.83rem;font-weight:500">
+            Show CPU &amp; memory stats for all containers
+        </span>
+        <span style="background:#e0f2fe;border:1px solid #bae6fd;color:#0369a1;
+                     padding:8px 16px;border-radius:20px;font-size:.83rem;font-weight:500">
+            Tail last 50 logs from my api container
+        </span>
+        <span style="background:#e0f2fe;border:1px solid #bae6fd;color:#0369a1;
+                     padding:8px 16px;border-radius:20px;font-size:.83rem;font-weight:500">
+            Prune all stopped containers &amp; dangling images
+        </span>
     </div>
 </div>
 """, unsafe_allow_html=True)
